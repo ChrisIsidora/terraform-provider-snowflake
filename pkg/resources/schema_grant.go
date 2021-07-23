@@ -4,6 +4,7 @@ import (
 	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
 	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/validation"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/jmoiron/sqlx"
 	"github.com/pkg/errors"
 )
 
@@ -63,6 +64,14 @@ var schemaGrantSchema = map[string]*schema.Schema{
 		Optional:    true,
 		Description: "Grants privilege to these shares (only valid if on_future is unset).",
 	},
+	"on_all": {
+		Type:          schema.TypeBool,
+		Optional:      true,
+		Description:   "When this is set to true, apply this grant on all existing schemas in the given database. The schema_name, shares and on_future fields must be unset in order to use on_all.",
+		Default:       false,
+		ForceNew:      true,
+		ConflictsWith: []string{"schema_name", "shares", "on_future"},
+	},
 	"on_future": {
 		Type:          schema.TypeBool,
 		Optional:      true,
@@ -108,16 +117,19 @@ func CreateSchemaGrant(d *schema.ResourceData, meta interface{}) error {
 	}
 	db := d.Get("database_name").(string)
 	priv := d.Get("privilege").(string)
+	onAll := d.Get("on_all").(bool)
 	onFuture := d.Get("on_future").(bool)
 	grantOption := d.Get("with_grant_option").(bool)
 
-	if (schema == "") && !onFuture {
-		return errors.New("schema_name must be set unless on_future is true.")
+	if (schema == "") && (!onFuture || !onAll) {
+		return errors.New("schema_name must be set unless on_future or on_all is true.")
 	}
 
 	var builder snowflake.GrantBuilder
 	if onFuture {
 		builder = snowflake.FutureSchemaGrant(db)
+	} else if onAll {
+		builder = snowflake.AllSchemaGrant(db)
 	} else {
 		builder = snowflake.SchemaGrant(db, schema)
 	}
@@ -132,6 +144,7 @@ func CreateSchemaGrant(d *schema.ResourceData, meta interface{}) error {
 		SchemaName:   schema,
 		Privilege:    priv,
 		GrantOption:  grantOption,
+		AllOption:    onAll,
 	}
 	dataIDInput, err := grantID.String()
 	if err != nil {
@@ -169,11 +182,14 @@ func UpdateSchemaGrant(d *schema.ResourceData, meta interface{}) error {
 	dbName := grantID.ResourceName
 	schemaName := grantID.SchemaName
 	onFuture := d.Get("on_future").(bool)
+	onAll := d.Get("on_all").(bool)
 
 	// create the builder
 	var builder snowflake.GrantBuilder
 	if onFuture {
 		builder = snowflake.FutureSchemaGrant(dbName)
+	} else if onAll {
+		builder = snowflake.AllSchemaGrant(dbName)
 	} else {
 		builder = snowflake.SchemaGrant(dbName, schemaName)
 	}
@@ -214,6 +230,8 @@ func ReadSchemaGrant(d *schema.ResourceData, meta interface{}) error {
 
 	dbName := grantID.ResourceName
 	schemaName := grantID.SchemaName
+	onAll := grantID.AllOption
+
 	err = d.Set("database_name", dbName)
 	if err != nil {
 		return err
@@ -222,8 +240,12 @@ func ReadSchemaGrant(d *schema.ResourceData, meta interface{}) error {
 	if err != nil {
 		return err
 	}
+	err = d.Set("on_all", onAll)
+	if err != nil {
+		return err
+	}
 	onFuture := false
-	if schemaName == "" {
+	if schemaName == "" && !onAll {
 		onFuture = true
 	}
 	err = d.Set("on_future", onFuture)
@@ -245,6 +267,23 @@ func ReadSchemaGrant(d *schema.ResourceData, meta interface{}) error {
 	} else {
 		builder = snowflake.SchemaGrant(dbName, schemaName)
 	}
+
+	if onAll {
+		db := meta.(*sqlx.DB)
+		builders := []snowflake.GrantBuilder{}
+
+		schemas, err := snowflake.ListSchemas(dbName, db)
+		if err != nil {
+			return err
+		}
+
+		for _, schema := range schemas {
+			builders = append(builders, snowflake.SchemaGrant(dbName, schema.Name.String))
+		}
+
+		return readGenericAllGrant(d, meta, schemaGrantSchema, builders, snowflake.AllSchemaGrant(dbName).GrantType(), validSchemaPrivileges)
+	}
+
 	return readGenericGrant(d, meta, schemaGrantSchema, builder, onFuture, validSchemaPrivileges)
 }
 
@@ -257,14 +296,17 @@ func DeleteSchemaGrant(d *schema.ResourceData, meta interface{}) error {
 
 	dbName := grantID.ResourceName
 	schemaName := grantID.SchemaName
+	onAll := grantID.AllOption
 	onFuture := false
-	if schemaName == "" {
+	if schemaName == "" && !onAll {
 		onFuture = true
 	}
 
 	var builder snowflake.GrantBuilder
 	if onFuture {
 		builder = snowflake.FutureSchemaGrant(dbName)
+	} else if onAll {
+		builder = snowflake.AllSchemaGrant(dbName)
 	} else {
 		builder = snowflake.SchemaGrant(dbName, schemaName)
 	}

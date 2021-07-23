@@ -82,6 +82,7 @@ type grantID struct {
 	ObjectName   string
 	Privilege    string
 	GrantOption  bool
+	AllOption    bool
 }
 
 // String() takes in a grantID object and returns a pipe-delimited string:
@@ -118,8 +119,13 @@ func grantIDFromString(stringID string) (*grantID, error) {
 	}
 
 	grantOption := false
-	if len(lines[0]) == 5 && lines[0][4] == "true" {
+	if len(lines[0]) >= 5 && lines[0][4] == "true" {
 		grantOption = true
+	}
+
+	allOption := false
+	if len(lines[0]) == 6 && lines[0][5] == "true" {
+		allOption = true
 	}
 
 	grantResult := &grantID{
@@ -128,6 +134,7 @@ func grantIDFromString(stringID string) (*grantID, error) {
 		ObjectName:   lines[0][2],
 		Privilege:    lines[0][3],
 		GrantOption:  grantOption,
+		AllOption:    allOption,
 	}
 	return grantResult, nil
 }
@@ -173,6 +180,43 @@ func createGenericGrant(d *schema.ResourceData, meta interface{}, builder snowfl
 	)
 }
 
+func readGenericAllGrant(
+	d *schema.ResourceData,
+	meta interface{},
+	schema map[string]*schema.Schema,
+	builders []snowflake.GrantBuilder,
+	grantType string,
+	validPrivileges PrivilegeSet) error {
+	var grants []*grant
+	db := meta.(*sql.DB)
+
+	for _, builder := range builders {
+		currentGrants, err := readGenericCurrentGrants(db, builder)
+		if err != nil {
+			// HACK HACK: If the object doesn't exist or not authorized then we can assume someone deleted it
+			// We also check the error number matches
+			// We set the tf id == blank and return.
+			// I don't know of a better way to work around this issue
+			if snowflakeErr, ok := err.(*gosnowflake.SnowflakeError); ok &&
+				snowflakeErr.Number == 2003 &&
+				strings.Contains(err.Error(), "does not exist or not authorized") {
+				log.Printf("[WARN] resource (%s) not found, removing from state file", d.Id())
+				d.SetId("")
+				return nil
+			}
+			return err
+		} else {
+			if grants == nil {
+				grants = currentGrants
+			} else {
+				grants = append(grants, currentGrants...)
+			}
+		}
+	}
+
+	return processReadGenericGrant(d, meta, schema, grants, grantType, true, validPrivileges)
+}
+
 func readGenericGrant(
 	d *schema.ResourceData,
 	meta interface{},
@@ -202,6 +246,20 @@ func readGenericGrant(
 		}
 		return err
 	}
+
+	return processReadGenericGrant(d, meta, schema, grants, builder.GrantType(), futureObjects, validPrivileges)
+}
+
+func processReadGenericGrant(
+	d *schema.ResourceData,
+	meta interface{},
+	schema map[string]*schema.Schema,
+	grants []*grant,
+	grantType string,
+	futureObjects bool,
+	validPrivileges PrivilegeSet) error {
+	var err error
+
 	priv := d.Get("privilege").(string)
 	grantOption := d.Get("with_grant_option").(bool)
 
@@ -221,7 +279,7 @@ func readGenericGrant(
 				privileges = PrivilegeSet{}
 			}
 
-			if strings.ReplaceAll(builder.GrantType(), " ", "_") == grant.GrantType {
+			if strings.ReplaceAll(grantType, " ", "_") == grant.GrantType {
 				privileges.addString(grant.Privilege)
 			}
 			// Reassign set back
